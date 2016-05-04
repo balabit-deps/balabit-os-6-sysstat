@@ -1,0 +1,11 @@
+00-Makefile.patch
+01-isag.patch
+02-sargraph.patch
+03-manpages.patch
+04-configs.patch
+06-exec.patch
+08-scripts.patch
+09-format-warning.patch
+10-isag-menu-refresh.patch
+12-isag-new-format-support.patch
+13-remove-sccsid.patch
