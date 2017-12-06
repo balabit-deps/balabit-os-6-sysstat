@@ -1,0 +1,133 @@
+Description: Handle segmantation fault while reading /etc/mtab
+ A segmentation fault may happen with "sadc -S DISK..." or
+ "sadc -S XDISK..." when lines longer than 512 bytes are read from
+ /etc/mtab.
+ 
+ Such lines are possible for instance when overlay2 filesystem
+ with docker is used. In such a case a single mtab entry can look
+ like this (note that new line characters were added for readability,
+ the original entry contained only one '\n' at the end):
+ 
+ overlay /var/lib/docker/overlay2/f23d2377a67b9ab1b49555ecd09b2ccdc03
+ 7e0ee5d9e54f87e59f07f4398e71f/merged overlay rw,relatime,lowerdir=/v
+ ar/lib/docker/overlay2/l/L6VKIYXWBQSJ5R7V35SS43R6Y6:/var/lib/docker/
+ overlay2/l/UCCHKGXUJPWCMLHR36IZJNNIQP:/var/lib/docker/overlay2/l/RKV
+ YEXD2FH65FTMK76RDWPLESX:/var/lib/docker/overlay2/l/DX4JZRKTFP2GOO4V6
+ OWQ6CPJFY:/var/lib/docker/overlay2/l/6CYNWDKADUPPDZJ5IHOH2R7Y5S:/var
+ /lib/docker/overlay2/l/JTPINUZIATXADL6XWFHG2OYGSF:/var/lib/docker/ov
+ erlay2/l/OTSTIV5TTRHF4IUD7BODQ2FUON:/var/lib/docker/overlay2/l/QFNH3
+ EFS5EZGRTC4DPHU3PJ4TU:/var/lib/docker/overlay2/l/ZOOUKT2E5U4CSLP57Z7
+ MXYX5CD:/var/lib/docker/overlay2/l/3LUU6IDR2HWPTVBARC5K6XSMRC:/var/l
+ ib/docker/overlay2/l/XOHYBP4RWXQKQZ43I7JKG24KE4:/var/lib/docker/over
+ lay2/l/MN5M5B7AY5LPXQQC6V2MBJWWBF:/var/lib/docker/overlay2/l/3DRMKQ3
+ 4AIZD2AROU3TVK3OCUT:/var/lib/docker/overlay2/l/73ZXDHBV6C53Q3SPXA57E
+ OLGHU:/var/lib/docker/overlay2/l/C2IZBQ55EUTGEAAORSLE73ZPNM:/var/lib
+ /docker/overlay2/l/ITHARNV7RPWN5S3BCZ2QDMZIMJ:/var/lib/docker/overla
+ y2/l/TQKUV4LEG4AFUUCMFHHRLDBHAH:/var/lib/docker/overlay2/l/N75JZWPPD
+ EKJ4DTN4GMEGTDIZL:/var/lib/docker/overlay2/l/QGUUYAETPMK643DG3AKWJAI
+ IZA,upperdir=/var/lib/docker/overlay2/f23d2377a67b9ab1b49555ecd09b2c
+ cdc037e0ee5d9e54f87e59f07f4398e71f/diff,workdir=/var/lib/docker/over
+ lay2/f23d2377a67b9ab1b49555ecd09b2ccdc037e0ee5d9e54f87e59f07f4398e71
+ f/work 0 0
+ 
+ The crash occurs in the get_filesystem_nr() and read_filesystem()
+ functions which call strchr(line, ' ') but fail to check if the result
+ is not NULL.
+ 
+ This patch adds this check, and when a single mtab entry requires more
+ that one call to fgets() (i.e. the entry is longer than 512 bytes), it
+ ignores outcome of the second and following calls.
+ .
+ sysstat (11.2.0-1ubuntu0.2) xenial; urgency=medium
+ .
+   * Add 14-fix-mtab-reading.patch to fix a crash occurring in sadc while
+     reading really long lines in /etc/mtab (LP: #1720627).
+Origin: upstream, https://github.com/sysstat/sysstat/commit/d40c8ecc530303d7e802617f21a9ac85dbcd68bd
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1720627
+
+Index: sysstat-11.2.0/count.c
+===================================================================
+--- sysstat-11.2.0.orig/count.c
++++ sysstat-11.2.0/count.c
+@@ -463,7 +463,8 @@ int get_filesystem_nr(void)
+ {
+ 	FILE *fp;
+ 	char line[512], fs_name[MAX_FS_LEN], mountp[256];
+-	int fs = 0;
++	int fs = 0, skip = 0, skip_next = 0;
++	char *pos = 0;
+ 	struct statvfs buf;
+ 
+ 	if ((fp = fopen(MTAB, "r")) == NULL)
+@@ -472,11 +473,25 @@ int get_filesystem_nr(void)
+ 
+ 	/* Get current filesystem */
+ 	while (fgets(line, sizeof(line), fp) != NULL) {
++		/*
++		 * Ignore line if the preceding line did not contain '\n'.
++		 * (Some very long lines may be found for instance when
++		 * overlay2 filesystem with docker is used).
++		 */
++		skip = skip_next;
++		skip_next = (strchr(line, '\n') == NULL);
++		if (skip)
++			continue;
++
+ 		if (line[0] == '/') {
++			/* Find field separator position */
++			pos = strchr(line, ' ');
++			if (pos == NULL)
++				continue;
+ 
+ 			/* Read filesystem name and mount point */
+ 			sscanf(line, "%127s", fs_name);
+-			sscanf(strchr(line, ' ') + 1, "%255s", mountp);
++			sscanf(pos + 1, "%255s", mountp);
+ 
+ 			/* Replace octal codes */
+ 			oct2chr(mountp);
+Index: sysstat-11.2.0/rd_stats.c
+===================================================================
+--- sysstat-11.2.0.orig/rd_stats.c
++++ sysstat-11.2.0/rd_stats.c
+@@ -2091,7 +2091,8 @@ void read_filesystem(struct stats_filesy
+ {
+ 	FILE *fp;
+ 	char line[512], fs_name[MAX_FS_LEN], mountp[256];
+-	int fs = 0;
++	int fs = 0, skip = 0, skip_next = 0;
++	char *pos = 0;
+ 	struct stats_filesystem *st_filesystem_i;
+ 	struct statvfs buf;
+ 
+@@ -2099,7 +2100,21 @@ void read_filesystem(struct stats_filesy
+ 		return;
+ 
+ 	while ((fgets(line, sizeof(line), fp) != NULL) && (fs < nbr)) {
++		/*
++		 * Ignore line if the preceding line did not contain '\n'.
++		 * (Some very long lines may be found for instance when
++		 * overlay2 filesystem with docker is used).
++		 */
++		skip = skip_next;
++		skip_next = (strchr(line, '\n') == NULL);
++		if (skip)
++			continue;
++
+ 		if (line[0] == '/') {
++			/* Find field separator position */
++			pos = strchr(line, ' ');
++			if (pos == NULL)
++				continue;
+ 
+ 			/* Read current filesystem name */
+ 			sscanf(line, "%127s", fs_name);
+@@ -2112,7 +2127,7 @@ void read_filesystem(struct stats_filesy
+ 			 * from the fs name. This will result in a bogus name
+ 			 * and following statvfs() function will always fail.
+ 			 */
+-			sscanf(strchr(line, ' ') + 1, "%255s", mountp);
++			sscanf(pos + 1, "%255s", mountp);
+ 
+ 			/* Replace octal codes */
+ 			oct2chr(mountp);
