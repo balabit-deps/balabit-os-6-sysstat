@@ -10,3 +10,4 @@
 12-isag-new-format-support.patch
 13-remove-sccsid.patch
 14-fix-mtab-reading.patch
+CVE-2019-19725.patch
